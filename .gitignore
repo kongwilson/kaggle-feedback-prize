@@ -127,3 +127,12 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# IDE
+/.idea
+
+# ml models
+/model_stores
+/wandb/
+*.csv
+*.odt
