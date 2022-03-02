@@ -15,7 +15,7 @@ import pandas as pd
 
 from sklearn.model_selection import StratifiedKFold
 from datasets import Dataset, load_metric
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, DistilBertTokenizer, DistilBertForTokenClassification, DistilBertTokenizerFast
 from transformers import AutoModelForTokenClassification, TrainingArguments, Trainer
 from transformers import DataCollatorForTokenClassification
 
@@ -84,7 +84,8 @@ model_checkpoint = os.path.join('model_stores', 'longformer-large-4096')
 
 # WK: `add_prefix_space` Whether or not to add an initial space to the input.
 #   This allows to treat the leading word just as any other word
-tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, add_prefix_space=True)
+# tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, add_prefix_space=True)
+tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased', add_prefix_space=True)
 
 e = [0, 7, 7, 7, 1, 1, 8, 8, 8, 9, 9, 9, 14, 4, 4, 4]
 
@@ -100,7 +101,7 @@ def fix_beginnings(labels):
 
 
 fix_beginnings(e)
-MAX_LENGTH = 1024
+MAX_LENGTH = 256
 STRIDE = 128
 
 
@@ -138,7 +139,11 @@ def tokenize_and_align_labels(examples):
 					labels[j] = l2i[f'I-{label}']
 
 		for k, input_id in enumerate(o['input_ids'][i]):
-			if input_id in [0, 1, 2]:  # 0: <s> (bos, cls); 1: <pad>; 2: </s> (eos, sep)
+			# for longformer
+			# if input_id in [0, 1, 2]:  # 0: <s> (bos, cls); 1: <pad>; 2: </s> (eos, sep)
+			# 	labels[k] = -100
+			# for DistilBert
+			if input_id in [101, 0, 102]:  # 101: <s> (bos, cls); 0: <pad>; 102: </s> (eos, sep)
 				labels[k] = -100
 
 		labels = fix_beginnings(labels)
@@ -152,13 +157,15 @@ def tokenize_and_align_labels(examples):
 #   the mapped function should accept an input with the format of a slice of the dataset: function(dataset[:10]).
 tokenized_datasets = datasets.map(
 	tokenize_and_align_labels, batched=True,
-	batch_size=20000, remove_columns=datasets["train"].column_names)
+	batch_size=4, remove_columns=datasets["train"].column_names)
 
 
-model = AutoModelForTokenClassification.from_pretrained(model_checkpoint, num_labels=N_LABELS)
+# model = AutoModelForTokenClassification.from_pretrained(model_checkpoint, num_labels=N_LABELS)
+model = DistilBertForTokenClassification.from_pretrained("distilbert-base-uncased")
 
 # %% [code] {"execution":{"iopub.status.busy":"2021-12-23T23:00:40.690854Z","iopub.execute_input":"2021-12-23T23:00:40.693718Z","iopub.status.idle":"2021-12-23T23:00:41.535273Z","shell.execute_reply.started":"2021-12-23T23:00:40.693672Z","shell.execute_reply":"2021-12-23T23:00:41.534215Z"}}
-model_name = model_checkpoint.split(os.path.sep)[-1]
+# model_name = model_checkpoint.split(os.path.sep)[-1]
+model_name = type(model).__name__
 task = 'ner'
 # TRAINING HYPERPARAMS
 BS = 1
@@ -168,7 +175,7 @@ WD = 0.01
 WARMUP = 0.1
 N_EPOCHS = 5
 
-PATY_TO_SAVE = os.path.join('model_stores', 'longformer-feedback_prize')
+PATH_TO_SAVE = os.path.join('model_stores', f'{model_name}-feedback_prize')
 
 args = TrainingArguments(
 	f"{model_name}-finetuned-{task}",
