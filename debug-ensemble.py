@@ -3,6 +3,7 @@ DESCRIPTION
 
 Copyright (C) Weicong Kong, 3/03/2022
 """
+import gc
 import numpy as np
 import pandas as pd
 import os
@@ -15,6 +16,8 @@ from torch.utils.data import DataLoader
 
 pd.options.display.max_columns = 50
 pd.options.display.width = 500
+
+gc.enable()
 
 from sklearn.model_selection import KFold
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
@@ -82,12 +85,14 @@ target_id_map = {
 id_target_map = {v: k for k, v in target_id_map.items()}
 
 
-def prepare_samples(df, tkz: transformers.models.longformer.tokenization_longformer_fast.LongformerTokenizerFast):
+def prepare_samples(
+        df, is_train: bool, tkz: transformers.models.longformer.tokenization_longformer_fast.LongformerTokenizerFast):
     # prepare test data so that they can be processed by the model
     samples = []
     ids = df['id'].unique()
+    train_or_test = 'train' if is_train else 'test'
     for idx in ids:
-        filename = os.path.join(DATA_ROOT, 'test', f'{idx}.txt')
+        filename = os.path.join(DATA_ROOT, train_or_test, f'{idx}.txt')
         with open(filename, 'r') as f:
             text = f.read()
 
@@ -197,9 +202,49 @@ class FeedbackModel(nn.Module):
         return logits, 0, {}
 
 
+def jn(pst, start, end):
+    return " ".join([str(x) for x in pst[start:end]])
+
+
+def link_evidence(oof):
+    thresh = 1
+    idu = oof['id'].unique()
+    idc = idu[1]
+    eoof = oof[oof['class'] == "Evidence"]
+    neoof = oof[oof['class'] != "Evidence"]
+    for thresh2 in range(26,27, 1):
+        retval = []
+        for idv in idu:
+            for c in  ['Lead', 'Position', 'Evidence', 'Claim', 'Concluding Statement',
+                   'Counterclaim', 'Rebuttal']:
+                q = eoof[(eoof['id'] == idv) & (eoof['class'] == c)]
+                if len(q) == 0:
+                    continue
+                pst = []
+                for i,r in q.iterrows():
+                    pst = pst +[-1] + [int(x) for x in r['predictionstring'].split()]
+                start = 1
+                end = 1
+                for i in range(2,len(pst)):
+                    cur = pst[i]
+                    end = i
+                    #if pst[start] == 205:
+                    #   print(cur, pst[start], cur - pst[start])
+                    if (cur == -1 and c != 'Evidence') or ((cur == -1) and ((pst[i+1] > pst[end-1] + thresh) or (pst[i+1] - pst[start] > thresh2))):
+                        retval.append((idv, c, jn(pst, start, end)))
+                        start = i + 1
+                v = (idv, c, jn(pst, start, end+1))
+                #print(v)
+                retval.append(v)
+        roof = pd.DataFrame(retval, columns = ['id', 'class', 'predictionstring'])
+        roof = roof.merge(neoof, how='outer')
+        return roof
+
+
 tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_STORE, 'longformer-large-4096/'))
 test_df = pd.read_csv(os.path.join(DATA_ROOT, 'sample_submission.csv'))
-test_samples = prepare_samples(test_df, tokenizer)
+test_samples = prepare_samples(test_df, is_train=False, tkz=tokenizer)
+train_samples = prepare_samples(train_df, is_train=True, tkz=tokenizer)
 collate = Collate(tkz=tokenizer)
 
 MAX_LENGTH = 4096
@@ -208,17 +253,120 @@ MAX_LENGTH = 4096
 raw_preds = []
 current_idx = 0
 test_dataset = FeedbackDataset(test_samples, MAX_LENGTH, tokenizer)
+train_dataset = FeedbackDataset(train_samples, MAX_LENGTH, tokenizer)
 model = FeedbackModel(
     model_name=os.path.join('model_stores', 'longformer-large-4096'), num_labels=len(target_id_map) - 1)
 model_path = os.path.join('model_stores', 'fblongformerlarge1536', 'model_0.bin')
 model_dict = torch.load(model_path)
 model.load_state_dict(model_dict)  # this loads the nn.Module and match all the parameters in model.transformer
 
-data_loader = DataLoader(
+test_data_loader = DataLoader(
     test_dataset, batch_size=8, num_workers=0, collate_fn=collate
 )
+train_data_loader = DataLoader(
+    train_dataset, batch_size=8, num_workers=0, collate_fn=collate
+)
 
-a_data = next(iter(data_loader))  # WKNOTE: get a sample from an iterable object
-pred = model(**a_data)
+a_data = next(iter(train_data_loader))  # WKNOTE: get a sample from an iterable object
+model.eval()
+with torch.no_grad():
+    pred = model(**a_data)
 
 
+pred_prob = pred[0]
+pred_prob =pred_prob.cpu().detach().numpy()
+pred_class = np.argmax(pred_prob, axis=2)
+pred_scrs = np.max(pred_prob, axis=2)
+
+
+train_debug_samples = train_samples[:8]
+for j in range(len(train_debug_samples)):
+    tt = [id_target_map[p] for p in pred_class[j][1:]]
+    tt_score = pred_scrs[j][1:]
+    train_debug_samples[j]['preds'] = tt
+    train_debug_samples[j]['pred_scores'] = tt_score
+
+
+proba_thresh = {
+    "Lead": 0.687,
+    "Position": 0.537,
+    "Evidence": 0.637,
+    "Claim": 0.537,
+    "Concluding Statement": 0.687,
+    "Counterclaim": 0.537,
+    "Rebuttal": 0.537,
+}
+
+min_thresh = {
+    "Lead": 9,
+    "Position": 5,
+    "Evidence": 14,
+    "Claim": 3,
+    "Concluding Statement": 11,
+    "Counterclaim": 6,
+    "Rebuttal": 4,
+}
+
+submission = []
+
+
+def build_feedback_prediction_string(
+        preds, sample_pred_scores, sample_id, sample_text, offset_mapping):
+    if len(preds) < len(offset_mapping):
+        preds = preds + ["O"] * (len(offset_mapping) - len(preds))
+        sample_pred_scores = sample_pred_scores + [0] * (len(offset_mapping) - len(sample_pred_scores))
+
+    # loop through each sub-token and construct the LABELLED discourse segments
+    idx = 0
+    discourse_labels_details = []
+    while idx < len(offset_mapping):
+        start, _ = offset_mapping[idx]
+        if preds[idx] != "O":
+            label = preds[idx][2:]
+        else:
+            label = "O"
+        phrase_scores = []
+        phrase_scores.append(sample_pred_scores[idx])
+        idx += 1
+        while idx < len(offset_mapping):
+            if label == "O":
+                matching_label = "O"
+            else:
+                matching_label = f"I-{label}"
+            if preds[idx] == matching_label:
+                _, end = offset_mapping[idx]
+                phrase_scores.append(sample_pred_scores[idx])
+                idx += 1
+            else:
+                break
+        if "end" in locals():
+            discourse = sample_text[start:end]
+            discourse_labels_details.append((discourse, start, end, label, phrase_scores))
+
+    temp_df = []
+    for phrase_idx, (discourse, start, end, label, phrase_scores) in enumerate(discourse_labels_details):
+        word_start = len(sample_text[:start].split())
+        word_end = word_start + len(sample_text[start:end].split())
+        word_end = min(word_end, len(sample_text.split()))
+        ps = " ".join([str(x) for x in range(word_start, word_end)])
+        if label != "O":
+            if sum(phrase_scores) / len(phrase_scores) >= proba_thresh[label]:
+                if len(ps.split()) >= min_thresh[label]:
+                    temp_df.append((sample_id, label, ps))
+    temp_df = pd.DataFrame(temp_df, columns=["id", "class", "predictionstring"])
+    return temp_df
+
+
+for sample_idx, sample in enumerate(train_debug_samples):
+    preds = sample["preds"]
+    offset_mapping = sample["offset_mapping"]
+    sample_id = sample["id"]
+    sample_text = sample["text"]
+    sample_pred_scores = sample["pred_scores"]
+    sample_preds = []
+
+    temp_df = build_feedback_prediction_string(preds, sample_pred_scores, sample_id, sample_text, offset_mapping)
+    submission.append(temp_df)
+
+submission = pd.concat(submission).reset_index(drop=True)
+submission = link_evidence(submission)
