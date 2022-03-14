@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 import pickle
+import optuna
 
 pd.options.display.max_columns = 50
 pd.options.display.width = 500
@@ -305,72 +306,14 @@ for ch in checkpoints:
             torch.cuda.empty_cache()
             gc.collect()
 
-        with open('train_pred_model_name_checkpoint.dat', 'wb') as f:
+        with open(pred_path, 'wb') as f:
             pickle.dump(pred_iter, f)
 
     pred_folds.append(pred_iter)
 
 
-# average for a model
-raw_preds = []
-n_folds = len(pred_folds)
-for fold, pred_fold in enumerate(pred_folds):
-
-    sample_idx = 0
-    for pred in pred_fold:
-        pred /= n_folds
-        if fold == 0:
-            raw_preds.append(pred)
-        else:
-            raw_preds[sample_idx] += pred
-            sample_idx += 1
-
-
-final_preds = []
-final_scores = []
-
-for rp in raw_preds:
-    pred_classes = np.argmax(rp, axis=1)
-    pred_scores = np.max(rp, axis=1)
-    final_preds.append(pred_classes.tolist())
-    final_scores.append(pred_scores.tolist())
-    # for pred_class, pred_score in zip(pred_classes, pred_scores):
-    #     pred_class = pred_class.tolist()
-    #     pred_score = pred_score.tolist()
-    #     final_preds.append(pred_class)
-    #     final_scores.append(pred_score)
-
-
-for j in range(len(train_samples)):
-    tt = [id_target_map[p] for p in final_preds[j][1:]]
-    tt_score = final_scores[j][1:]
-    train_samples[j]['preds'] = tt
-    train_samples[j]['pred_scores'] = tt_score
-
-
-proba_thresh = {
-    "Lead": 0.687,
-    "Position": 0.537,
-    "Evidence": 0.637,
-    "Claim": 0.537,
-    "Concluding Statement": 0.687,
-    "Counterclaim": 0.537,
-    "Rebuttal": 0.537,
-}
-
-min_thresh = {
-    "Lead": 9,
-    "Position": 5,
-    "Evidence": 14,
-    "Claim": 3,
-    "Concluding Statement": 11,
-    "Counterclaim": 6,
-    "Rebuttal": 4,
-}
-
-
 def build_feedback_prediction_string(
-        preds, sample_pred_scores, sample_id, sample_text, offset_mapping):
+        preds, sample_pred_scores, sample_id, sample_text, offset_mapping, proba_thresh, min_thresh):
     if len(preds) < len(offset_mapping):
         preds = preds + ["O"] * (len(offset_mapping) - len(preds))
         sample_pred_scores = sample_pred_scores + [0] * (len(offset_mapping) - len(sample_pred_scores))
@@ -414,26 +357,6 @@ def build_feedback_prediction_string(
                     temp_df.append((sample_id, label, ps))
     temp_df = pd.DataFrame(temp_df, columns=["id", "class", "predictionstring"])
     return temp_df
-
-
-submission = []
-
-for sample_idx, sample in enumerate(train_samples):
-    preds = sample["preds"]
-    offset_mapping = sample["offset_mapping"]
-    sample_id = sample["id"]
-    sample_text = sample["text"]
-    sample_pred_scores = sample["pred_scores"]
-    sample_preds = []
-
-    temp_df = build_feedback_prediction_string(preds, sample_pred_scores, sample_id, sample_text, offset_mapping)
-    submission.append(temp_df)
-
-submission = pd.concat(submission).reset_index(drop=True)
-submission = link_evidence(submission)
-
-train_pref_df = submission.copy()
-train_groud_truth_df = train_df[train_df['id'].isin(train_pref_df['id'].unique())].copy()
 
 
 # the following 3 funcs are from https://www.kaggle.com/cpmpml/faster-metric-computation
@@ -507,5 +430,108 @@ def score_feedback_comp3(pred_df, gt_df, return_class_scores=False):
     return f1
 
 
-micro_lead = score_feedback_comp_micro3(train_pref_df, train_groud_truth_df, 'Lead')
-macro_f1 = score_feedback_comp3(train_pref_df, train_groud_truth_df)
+# average for a model
+
+
+def ensemble_and_post_processing_loss_func(trial: optuna.trial.Trial):
+
+    n_folds = len(pred_folds)
+
+    params = {
+        f'w_{idx}': trial.suggest_uniform(f'w_{idx}', 0, 1) for idx in range(n_folds - 1)
+    }
+
+    raw_preds = []
+    weights = []
+    for fold, pred_fold in enumerate(pred_folds):
+        weight = params[f'w_{fold}'] if fold < n_folds - 1 else 0
+        weights.append(weight)
+
+        sample_idx = 0
+        for pred in pred_fold:
+            if fold != n_folds - 1:
+                pred *= weight
+            else:
+                pred *= (1 - sum(weights))
+            if fold == 0:
+                raw_preds.append(pred)
+            else:
+                raw_preds[sample_idx] += pred
+                sample_idx += 1
+
+    final_preds = []
+    final_scores = []
+
+    for rp in raw_preds:
+        pred_classes = np.argmax(rp, axis=1)
+        pred_scores = np.max(rp, axis=1)
+        final_preds.append(pred_classes.tolist())
+        final_scores.append(pred_scores.tolist())
+        # for pred_class, pred_score in zip(pred_classes, pred_scores):
+        #     pred_class = pred_class.tolist()
+        #     pred_score = pred_score.tolist()
+        #     final_preds.append(pred_class)
+        #     final_scores.append(pred_score)
+
+
+    for j in range(len(train_samples)):
+        tt = [id_target_map[p] for p in final_preds[j][1:]]
+        tt_score = final_scores[j][1:]
+        train_samples[j]['preds'] = tt
+        train_samples[j]['pred_scores'] = tt_score
+
+    proba_thresh = {
+        "Lead": 0.687,
+        "Position": 0.537,
+        "Evidence": 0.637,
+        "Claim": 0.537,
+        "Concluding Statement": 0.687,
+        "Counterclaim": 0.537,
+        "Rebuttal": 0.537,
+    }
+
+    min_thresh = {
+        "Lead": 9,
+        "Position": 5,
+        "Evidence": 14,
+        "Claim": 3,
+        "Concluding Statement": 11,
+        "Counterclaim": 6,
+        "Rebuttal": 4,
+    }
+
+    submission = []
+
+    for sample_idx, sample in enumerate(train_samples):
+        preds = sample["preds"]
+        offset_mapping = sample["offset_mapping"]
+        sample_id = sample["id"]
+        sample_text = sample["text"]
+        sample_pred_scores = sample["pred_scores"]
+        sample_preds = []
+
+        temp_df = build_feedback_prediction_string(
+            preds, sample_pred_scores, sample_id, sample_text, offset_mapping, proba_thresh, min_thresh)
+        submission.append(temp_df)
+
+    submission = pd.concat(submission).reset_index(drop=True)
+    submission = link_evidence(submission)
+
+    train_pref_df = submission.copy()
+    train_groud_truth_df = train_df[train_df['id'].isin(train_pref_df['id'].unique())].copy()
+
+    # micro_lead = score_feedback_comp_micro3(train_pref_df, train_groud_truth_df, 'Lead')
+    macro_f1 = score_feedback_comp3(train_pref_df, train_groud_truth_df)
+    return macro_f1
+
+
+study_db_path = 'ensemble.db'
+study = optuna.create_study(
+    direction='maximize', study_name='ensemble_fblongformer1536',
+    storage=f'sqlite:///{study_db_path}', load_if_exists=True
+)
+study.optimize(ensemble_and_post_processing_loss_func, n_trials=200)
+best_params = study.best_params
+print(f'the best model params are found on Trial #{study.best_trial.number}')
+print(best_params)
+
