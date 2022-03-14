@@ -211,7 +211,7 @@ def jn(pst, start, end):
 def link_evidence(oof):
     thresh = 1
     idu = oof['id'].unique()
-    idc = idu[1]
+    # idc = idu[1]
     eoof = oof[oof['class'] == "Evidence"]
     neoof = oof[oof['class'] != "Evidence"]
     for thresh2 in range(26,27, 1):
@@ -247,7 +247,7 @@ tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_STORE, 'longformer-
 test_df = pd.read_csv(os.path.join(DATA_ROOT, 'sample_submission.csv'))
 
 # for debug
-train_df = train_df[train_df['id'].isin(train_df['id'].unique()[:10])].copy()
+# train_df = train_df[train_df['id'].isin(train_df['id'].unique()[:10])].copy()
 
 # a sample is a dict of 'id', 'input_ids', 'text', 'offset_mapping'
 test_samples = prepare_samples(test_df, is_train=False, tkz=tokenizer)
