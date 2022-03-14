@@ -247,7 +247,7 @@ tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_STORE, 'longformer-
 test_df = pd.read_csv(os.path.join(DATA_ROOT, 'sample_submission.csv'))
 
 # for debug
-# train_df = train_df[train_df['id'].isin(train_df['id'].unique()[:10])].copy()
+train_df = train_df[train_df['id'].isin(train_df['id'].unique()[:20])].copy()
 
 # a sample is a dict of 'id', 'input_ids', 'text', 'offset_mapping'
 test_samples = prepare_samples(test_df, is_train=False, tkz=tokenizer)
@@ -437,28 +437,33 @@ def ensemble_and_post_processing_loss_func(trial: optuna.trial.Trial):
 
     n_folds = len(pred_folds)
 
-    params = {
-        f'w_{idx}': trial.suggest_uniform(f'w_{idx}', 0, 1) for idx in range(n_folds - 1)
-    }
+    # WKNOTE: set up a bunch of weights that follow a dirichlet distribution
+    x = []
+    for i in range(n_folds):
+        x.append(- np.log(trial.suggest_float(f'x_{i}', 0, 1)))
 
-    raw_preds = []
     weights = []
+    for i in range(n_folds):
+        weights.append(x[i] / sum(x))
+
+    for i in range(n_folds):
+        trial.set_user_attr(f'w_{i}', weights[i])
+
+    print(weights)
+    raw_preds = []
     for fold, pred_fold in enumerate(pred_folds):
-        weight = params[f'w_{fold}'] if fold < n_folds - 1 else 0
-        weights.append(weight)
 
         sample_idx = 0
         for pred in pred_fold:
-            if fold != n_folds - 1:
-                pred *= weight
-            else:
-                pred *= (1 - sum(weights))
+            weighted_pred = pred * weights[fold]
             if fold == 0:
-                raw_preds.append(pred)
+                raw_preds.append(weighted_pred)
             else:
-                raw_preds[sample_idx] += pred
+                raw_preds[sample_idx] += weighted_pred
                 sample_idx += 1
 
+    # print(np.sum(pred_folds[-1][-1], axis=1))
+    # print(np.sum(raw_preds[-1], axis=1))
     final_preds = []
     final_scores = []
 
@@ -473,31 +478,49 @@ def ensemble_and_post_processing_loss_func(trial: optuna.trial.Trial):
         #     final_preds.append(pred_class)
         #     final_scores.append(pred_score)
 
-
     for j in range(len(train_samples)):
         tt = [id_target_map[p] for p in final_preds[j][1:]]
         tt_score = final_scores[j][1:]
         train_samples[j]['preds'] = tt
         train_samples[j]['pred_scores'] = tt_score
 
+    # proba_thresh = {
+    #     "Lead": 0.687,
+    #     "Position": 0.537,
+    #     "Evidence": 0.637,
+    #     "Claim": 0.537,
+    #     "Concluding Statement": 0.687,
+    #     "Counterclaim": 0.537,
+    #     "Rebuttal": 0.537,
+    # }
+
     proba_thresh = {
-        "Lead": 0.687,
-        "Position": 0.537,
-        "Evidence": 0.637,
-        "Claim": 0.537,
-        "Concluding Statement": 0.687,
-        "Counterclaim": 0.537,
-        "Rebuttal": 0.537,
+        "Lead": trial.suggest_uniform('proba_thres_lead', 0.1, 0.9),
+        "Position": trial.suggest_uniform('proba_thres_position', 0.1, 0.9),
+        "Evidence": trial.suggest_uniform('proba_thres_evidence', 0.1, 0.9),
+        "Claim": trial.suggest_uniform('proba_thres_claim', 0.1, 0.9),
+        "Concluding Statement": trial.suggest_uniform('proba_thres_conclusion', 0.1, 0.9),
+        "Counterclaim": trial.suggest_uniform('proba_thres_counter', 0.1, 0.9),
+        "Rebuttal": trial.suggest_uniform('proba_thres_rebuttal', 0.1, 0.9),
     }
 
+    # min_thresh = {
+    #     "Lead": 9,
+    #     "Position": 5,
+    #     "Evidence": 14,
+    #     "Claim": 3,
+    #     "Concluding Statement": 11,
+    #     "Counterclaim": 6,
+    #     "Rebuttal": 4,
+    # }
     min_thresh = {
-        "Lead": 9,
-        "Position": 5,
-        "Evidence": 14,
-        "Claim": 3,
-        "Concluding Statement": 11,
-        "Counterclaim": 6,
-        "Rebuttal": 4,
+        "Lead": trial.suggest_int('min_lead', 1, 20),
+        "Position": trial.suggest_int('min_position', 1, 20),
+        "Evidence": trial.suggest_int('min_evidence', 1, 20),
+        "Claim": trial.suggest_int('min_claim', 1, 20),
+        "Concluding Statement": trial.suggest_int('min_conclusion', 1, 20),
+        "Counterclaim": trial.suggest_int('min_counter', 1, 20),
+        "Rebuttal": trial.suggest_int('min_rebuttal', 1, 20)
     }
 
     submission = []
@@ -517,11 +540,11 @@ def ensemble_and_post_processing_loss_func(trial: optuna.trial.Trial):
     submission = pd.concat(submission).reset_index(drop=True)
     submission = link_evidence(submission)
 
-    train_pref_df = submission.copy()
-    train_groud_truth_df = train_df[train_df['id'].isin(train_pref_df['id'].unique())].copy()
+    train_pred_df = submission.copy()
+    train_groud_truth_df = train_df[train_df['id'].isin(train_pred_df['id'].unique())].copy()
 
     # micro_lead = score_feedback_comp_micro3(train_pref_df, train_groud_truth_df, 'Lead')
-    macro_f1 = score_feedback_comp3(train_pref_df, train_groud_truth_df)
+    macro_f1 = score_feedback_comp3(train_pred_df, train_groud_truth_df)
     return macro_f1
 
 
@@ -530,7 +553,7 @@ study = optuna.create_study(
     direction='maximize', study_name='ensemble_fblongformer1536',
     storage=f'sqlite:///{study_db_path}', load_if_exists=True
 )
-study.optimize(ensemble_and_post_processing_loss_func, n_trials=200)
+study.optimize(ensemble_and_post_processing_loss_func, n_trials=2000)
 best_params = study.best_params
 print(f'the best model params are found on Trial #{study.best_trial.number}')
 print(best_params)
