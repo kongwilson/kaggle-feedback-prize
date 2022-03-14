@@ -13,6 +13,7 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+import pickle
 
 pd.options.display.max_columns = 50
 pd.options.display.width = 500
@@ -243,6 +244,11 @@ def link_evidence(oof):
 
 tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_STORE, 'longformer-large-4096/'))
 test_df = pd.read_csv(os.path.join(DATA_ROOT, 'sample_submission.csv'))
+
+# for debug
+train_df = train_df[train_df['id'].isin(train_df['id'].unique()[:10])].copy()
+
+# a sample is a dict of 'id', 'input_ids', 'text', 'offset_mapping'
 test_samples = prepare_samples(test_df, is_train=False, tkz=tokenizer)
 train_samples = prepare_samples(train_df, is_train=True, tkz=tokenizer)
 collate = Collate(tkz=tokenizer)
@@ -250,67 +256,96 @@ collate = Collate(tkz=tokenizer)
 MAX_LENGTH = 4096
 
 import glob
+
 path_to_saved_model = os.path.join('model_stores', 'fblongformerlarge1536')
 checkpoints = glob.glob(os.path.join(path_to_saved_model, '*.bin'))
 
 pred_folds = []
 for ch in checkpoints:
 
-    test_dataset = FeedbackDataset(test_samples, MAX_LENGTH, tokenizer)
-    train_dataset = FeedbackDataset(train_samples, MAX_LENGTH, tokenizer)
-    model = FeedbackModel(
-        model_name=os.path.join('model_stores', 'longformer-large-4096'), num_labels=len(target_id_map) - 1)
-    model_path = os.path.join('model_stores', 'fblongformerlarge1536', ch)
-    model_dict = torch.load(model_path)
-    model.load_state_dict(model_dict)  # this loads the nn.Module and match all the parameters in model.transformer
+    ch_parts = ch.split(os.path.sep)
+    pred_folder = os.path.join('preds', ch_parts[1])
+    os.makedirs(pred_folder, exist_ok=True)
+    pred_path = os.path.join(pred_folder, f'{os.path.splitext(ch_parts[-1])[0]}.dat')
+    if os.path.exists(pred_path):
+        with open(pred_path, 'rb') as f:
+            pred_iter = pickle.load(f)
+    else:
 
-    test_data_loader = DataLoader(
-        test_dataset, batch_size=8, num_workers=0, collate_fn=collate
-    )
-    train_data_loader = DataLoader(
-        train_dataset, batch_size=8, num_workers=0, collate_fn=collate
-    )
+        test_dataset = FeedbackDataset(test_samples, MAX_LENGTH, tokenizer)
+        train_dataset = FeedbackDataset(train_samples, MAX_LENGTH, tokenizer)
+        model = FeedbackModel(
+            model_name=os.path.join('model_stores', 'longformer-large-4096'), num_labels=len(target_id_map) - 1)
+        model_path = os.path.join(ch)
+        model_dict = torch.load(model_path)
+        model.load_state_dict(model_dict)  # this loads the nn.Module and match all the parameters in model.transformer
 
-    iterator = iter(train_data_loader)
-    a_data = next(iterator)  # WKNOTE: get a sample from an iterable object
-    model.eval()
+        test_data_loader = DataLoader(
+            test_dataset, batch_size=8, num_workers=0, collate_fn=collate
+        )
+        train_data_loader = DataLoader(
+            train_dataset, batch_size=8, num_workers=0, collate_fn=collate
+        )
 
-    pred_iter = []
-    with torch.no_grad():
+        iterator = iter(train_data_loader)
+        a_data = next(iterator)  # WKNOTE: get a sample from an iterable object
+        model.eval()
 
-        # pred = model(**a_data)
+        pred_iter = []
+        with torch.no_grad():
 
-        for sample in tqdm(train_data_loader, desc='Predicting. '):
-            pred = model(**sample)
-            pred_prob = pred[0].cpu().detach().numpy().tolist()
-            pred_prob = [np.array(l) for l in pred_prob]  # to list of ndarray
-            pred_iter.extend(pred_prob)
+            # pred = model(**a_data)
 
-        torch.cuda.empty_cache()
-        gc.collect()
+            for sample in tqdm(train_data_loader, desc='Predicting. '):
+                pred = model(**sample)
+                pred_prob = pred[0].cpu().detach().numpy().tolist()
+                pred_prob = [np.array(l) for l in pred_prob]  # to list of ndarray
+                pred_iter.extend(pred_prob)
+
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        with open('train_pred_model_name_checkpoint.dat', 'wb') as f:
+            pickle.dump(pred_iter, f)
 
     pred_folds.append(pred_iter)
 
 
-import pickle
-with open('train_pred_model_name_checkpoint.dat', 'wb') as f:
-    pickle.dump(pred_iter, f)
+# average for a model
+raw_preds = []
+n_folds = len(pred_folds)
+for fold, pred_fold in enumerate(pred_folds):
+
+    sample_idx = 0
+    for pred in pred_fold:
+        pred /= n_folds
+        if fold == 0:
+            raw_preds.append(pred)
+        else:
+            raw_preds[sample_idx] += pred
+            sample_idx += 1
 
 
-with open('train_pred_model_name_checkpoint.dat', 'rb') as f:
-    loaded = pickle.load(f)
+final_preds = []
+final_scores = []
+
+for rp in raw_preds:
+    pred_classes = np.argmax(rp, axis=1)
+    pred_scores = np.max(rp, axis=1)
+    final_preds.append(pred_classes.tolist())
+    final_scores.append(pred_scores.tolist())
+    # for pred_class, pred_score in zip(pred_classes, pred_scores):
+    #     pred_class = pred_class.tolist()
+    #     pred_score = pred_score.tolist()
+    #     final_preds.append(pred_class)
+    #     final_scores.append(pred_score)
 
 
-pred_class = np.argmax(pred_prob, axis=2)
-pred_scrs = np.max(pred_prob, axis=2)
-
-
-train_debug_samples = train_samples[:8]
 for j in range(len(train_samples)):
-    tt = [id_target_map[p] for p in pred_class[j][1:]]
-    tt_score = pred_scrs[j][1:]
-    train_debug_samples[j]['preds'] = tt
-    train_debug_samples[j]['pred_scores'] = tt_score
+    tt = [id_target_map[p] for p in final_preds[j][1:]]
+    tt_score = final_scores[j][1:]
+    train_samples[j]['preds'] = tt
+    train_samples[j]['pred_scores'] = tt_score
 
 
 proba_thresh = {
@@ -383,7 +418,7 @@ def build_feedback_prediction_string(
 
 submission = []
 
-for sample_idx, sample in enumerate(train_debug_samples):
+for sample_idx, sample in enumerate(train_samples):
     preds = sample["preds"]
     offset_mapping = sample["offset_mapping"]
     sample_id = sample["id"]
