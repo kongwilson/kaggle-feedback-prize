@@ -249,38 +249,64 @@ collate = Collate(tkz=tokenizer)
 
 MAX_LENGTH = 4096
 
+import glob
+path_to_saved_model = os.path.join('model_stores', 'fblongformerlarge1536')
+checkpoints = glob.glob(os.path.join(path_to_saved_model, '*.bin'))
 
-raw_preds = []
-current_idx = 0
-test_dataset = FeedbackDataset(test_samples, MAX_LENGTH, tokenizer)
-train_dataset = FeedbackDataset(train_samples, MAX_LENGTH, tokenizer)
-model = FeedbackModel(
-    model_name=os.path.join('model_stores', 'longformer-large-4096'), num_labels=len(target_id_map) - 1)
-model_path = os.path.join('model_stores', 'fblongformerlarge1536', 'model_0.bin')
-model_dict = torch.load(model_path)
-model.load_state_dict(model_dict)  # this loads the nn.Module and match all the parameters in model.transformer
+pred_folds = []
+for ch in checkpoints:
 
-test_data_loader = DataLoader(
-    test_dataset, batch_size=8, num_workers=0, collate_fn=collate
-)
-train_data_loader = DataLoader(
-    train_dataset, batch_size=8, num_workers=0, collate_fn=collate
-)
+    test_dataset = FeedbackDataset(test_samples, MAX_LENGTH, tokenizer)
+    train_dataset = FeedbackDataset(train_samples, MAX_LENGTH, tokenizer)
+    model = FeedbackModel(
+        model_name=os.path.join('model_stores', 'longformer-large-4096'), num_labels=len(target_id_map) - 1)
+    model_path = os.path.join('model_stores', 'fblongformerlarge1536', ch)
+    model_dict = torch.load(model_path)
+    model.load_state_dict(model_dict)  # this loads the nn.Module and match all the parameters in model.transformer
 
-a_data = next(iter(train_data_loader))  # WKNOTE: get a sample from an iterable object
-model.eval()
-with torch.no_grad():
-    pred = model(**a_data)
+    test_data_loader = DataLoader(
+        test_dataset, batch_size=8, num_workers=0, collate_fn=collate
+    )
+    train_data_loader = DataLoader(
+        train_dataset, batch_size=8, num_workers=0, collate_fn=collate
+    )
+
+    iterator = iter(train_data_loader)
+    a_data = next(iterator)  # WKNOTE: get a sample from an iterable object
+    model.eval()
+
+    pred_iter = []
+    with torch.no_grad():
+
+        # pred = model(**a_data)
+
+        for sample in tqdm(train_data_loader, desc='Predicting. '):
+            pred = model(**sample)
+            pred_prob = pred[0].cpu().detach().numpy().tolist()
+            pred_prob = [np.array(l) for l in pred_prob]  # to list of ndarray
+            pred_iter.extend(pred_prob)
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    pred_folds.append(pred_iter)
 
 
-pred_prob = pred[0]
-pred_prob =pred_prob.cpu().detach().numpy()
+import pickle
+with open('train_pred_model_name_checkpoint.dat', 'wb') as f:
+    pickle.dump(pred_iter, f)
+
+
+with open('train_pred_model_name_checkpoint.dat', 'rb') as f:
+    loaded = pickle.load(f)
+
+
 pred_class = np.argmax(pred_prob, axis=2)
 pred_scrs = np.max(pred_prob, axis=2)
 
 
 train_debug_samples = train_samples[:8]
-for j in range(len(train_debug_samples)):
+for j in range(len(train_samples)):
     tt = [id_target_map[p] for p in pred_class[j][1:]]
     tt_score = pred_scrs[j][1:]
     train_debug_samples[j]['preds'] = tt
