@@ -247,7 +247,7 @@ tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_STORE, 'longformer-
 test_df = pd.read_csv(os.path.join(DATA_ROOT, 'sample_submission.csv'))
 
 # for debug
-train_df = train_df[train_df['id'].isin(train_df['id'].unique()[:20])].copy()
+# train_df = train_df[train_df['id'].isin(train_df['id'].unique()[:20])].copy()
 
 # a sample is a dict of 'id', 'input_ids', 'text', 'offset_mapping'
 test_samples = prepare_samples(test_df, is_train=False, tkz=tokenizer)
@@ -262,6 +262,7 @@ path_to_saved_model = os.path.join('model_stores', 'fblongformerlarge1536')
 checkpoints = glob.glob(os.path.join(path_to_saved_model, '*.bin'))
 
 pred_folds = []
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 for ch in checkpoints:
 
     ch_parts = ch.split(os.path.sep)
@@ -280,12 +281,13 @@ for ch in checkpoints:
         model_path = os.path.join(ch)
         model_dict = torch.load(model_path)
         model.load_state_dict(model_dict)  # this loads the nn.Module and match all the parameters in model.transformer
+        model.to(device)
 
         test_data_loader = DataLoader(
             test_dataset, batch_size=8, num_workers=0, collate_fn=collate
         )
         train_data_loader = DataLoader(
-            train_dataset, batch_size=8, num_workers=0, collate_fn=collate
+            train_dataset, batch_size=1, num_workers=0, collate_fn=collate
         )
 
         iterator = iter(train_data_loader)
@@ -298,11 +300,13 @@ for ch in checkpoints:
             # pred = model(**a_data)
 
             for sample in tqdm(train_data_loader, desc='Predicting. '):
-                pred = model(**sample)
+                sample_gpu = {k: sample[k].to(device) for k in sample}
+                pred = model(**sample_gpu)
                 pred_prob = pred[0].cpu().detach().numpy().tolist()
                 pred_prob = [np.array(l) for l in pred_prob]  # to list of ndarray
                 pred_iter.extend(pred_prob)
 
+            del sample_gpu
             torch.cuda.empty_cache()
             gc.collect()
 
