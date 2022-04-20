@@ -247,7 +247,7 @@ tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_STORE, 'longformer-
 test_df = pd.read_csv(os.path.join(DATA_ROOT, 'sample_submission.csv'))
 
 # for debug
-# train_df = train_df[train_df['id'].isin(train_df['id'].unique()[:20])].copy()
+train_df = train_df[train_df['id'].isin(train_df['id'].unique()[:20])].copy()
 
 # a sample is a dict of 'id', 'input_ids', 'text', 'offset_mapping'
 test_samples = prepare_samples(test_df, is_train=False, tkz=tokenizer)
